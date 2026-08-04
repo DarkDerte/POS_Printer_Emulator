@@ -10,3 +10,10 @@ eframe = "0.35.0"
 encoding_rs = "0.8.35"
 font8x8 = "0.3.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = "z"     # optimizar para tamaño
+lto = true          # link time optimization
+codegen-units = 1   # mejor optimización
+panic = "abort"     # elimina código de unwinding
+strip = true        # quita símbolos
