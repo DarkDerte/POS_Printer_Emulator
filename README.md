@@ -5,7 +5,7 @@ Emulador de impresora POS (ESC/POS) para Windows, escrito en Rust. Crea una impr
 ## Características
 
 - **Servidor TCP en el puerto 9100** (protocolo RAW, estándar en impresoras térmicas de red). Cualquier aplicación que sepa imprimir a `127.0.0.1:9100` puede enviar documentos.
-- **Impresora registrada en Windows**: la app crea la impresora `POS Printer Emulator` conectada a un puerto RAW local (`POSEmulator` → `127.0.0.1:9100`), de modo que aparece en el diálogo de impresión de cualquier programa y se puede "imprimir" sin tocar el código.
+- **Impresora registrada en Windows**: la app crea la impresora `POS Printer Emulator` conectada a un puerto RAW local (`POSEmulator` → `127.0.0.1:9100`), usando automáticamente el driver genérico POS disponible (`Generic / Text Only`, `Generic / ESC/POS`, ...). Aparece en el diálogo de impresión de cualquier programa y se puede "imprimir" sin tocar el código.
 - **Previsualización en tiempo real**: cada documento se renderiza como bitmap (58/80/112 mm de papel) con zoom, y se puede exportar a PNG.
 - **Historial de peticiones**: lista de trabajos con hora, origen, tamaño, hexdump de los bytes crudos y resumen de los comandos ESC/POS detectados.
 - **Registro y desinstalación** de la impresora desde la propia interfaz (con reintento elevado vía UAC si se requieren permisos de administrador).

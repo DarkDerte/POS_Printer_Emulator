@@ -12,13 +12,20 @@ $okFile = "$env:TEMP\pos_emu_reg_ok"
 $errFile = "$env:TEMP\pos_emu_reg_err"
 Remove-Item $okFile,$errFile -ErrorAction SilentlyContinue
 try {
+    $candidates = @('Generic / Text Only','Generic / ESC/POS','Generic / Text')
+    $drv = Get-PrinterDriver | Where-Object { $candidates -contains $_.Name } | Select-Object -First 1
+    if (-not $drv) {
+        throw "No se encontro un driver generico POS instalado. Candidatos: $($candidates -join ', ')"
+    }
     if (-not (Get-PrinterPort -Name 'POSEmulator' -ErrorAction SilentlyContinue)) {
         Add-PrinterPort -Name 'POSEmulator' -PrinterHostAddress '127.0.0.1' -PortNumber 9100
     }
-    if (-not (Get-Printer -Name 'POS Printer Emulator' -ErrorAction SilentlyContinue)) {
-        Add-Printer -Name 'POS Printer Emulator' -DriverName 'Generic / Text Only' -PortName 'POSEmulator'
+    if (Get-Printer -Name 'POS Printer Emulator' -ErrorAction SilentlyContinue) {
+        Set-Printer -Name 'POS Printer Emulator' -DriverName $drv.Name
+    } else {
+        Add-Printer -Name 'POS Printer Emulator' -DriverName $drv.Name -PortName 'POSEmulator'
     }
-    Set-Content -Path $okFile -Value 'ok'
+    Set-Content -Path $okFile -Value $drv.Name
 } catch {
     Set-Content -Path $errFile -Value $_.Exception.Message
 }
@@ -73,7 +80,13 @@ fn run_elevated(script: &Path) -> (bool, String) {
 
 fn check_marker(ok_file: &str, err_file: &str) -> RegResult {
     if Path::new(ok_file).exists() {
-        RegResult::Ok("Operación completada correctamente".to_string())
+        let info = std::fs::read_to_string(ok_file).unwrap_or_default();
+        let drv = info.trim();
+        if drv.is_empty() || drv == "ok" {
+            RegResult::Ok("Operación completada correctamente".to_string())
+        } else {
+            RegResult::Ok(format!("Impresora registrada con el driver '{drv}'"))
+        }
     } else {
         let err = std::fs::read_to_string(err_file).unwrap_or_else(|_| "error desconocido".into());
         RegResult::NeedsAdmin(err)
