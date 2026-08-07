@@ -1,6 +1,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod barcode;
+mod barcode2d;
 mod codepages;
+mod nvstore;
 mod parser;
 mod printer;
 mod render;
@@ -44,6 +47,10 @@ impl EmuApp {
         let stop = Arc::new(AtomicBool::new(false));
         let port: u16 = 9100;
         let ctx = cc.egui_ctx.clone();
+        // Cargar la memoria NV persistente (logos, fuentes, densidad)
+        if let Some(m) = nvstore::load() {
+            state.lock().unwrap().memory = m;
+        }
         let server = Some(server::spawn(
             state.clone(),
             fonts.clone(),
@@ -95,17 +102,37 @@ impl EmuApp {
 
     fn send_test(&mut self) {
         let data = sample::demo_receipt();
+        self.send_bytes(
+            data,
+            format!("Documento de prueba enviado a 127.0.0.1:{}", self.port),
+        );
+    }
+
+    // Avance físico de papel: ESC J n avanza n/203 pulgada (~0.125 mm por unidad).
+    fn send_feed(&mut self, units: usize) {
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0x1B, 0x4A]);
+        d.push(units.min(255) as u8);
+        let mm = units as f32 * (25.4 / 203.0);
+        self.send_bytes(
+            d,
+            format!("Avance físico: {units} unidades ≈ {mm:.1} mm (203 dpi)"),
+        );
+    }
+
+    fn send_cut(&mut self) {
+        self.send_bytes(vec![0x1D, 0x56, 0x42], "Corte de papel (GS V 66)".to_string());
+    }
+
+    fn send_bytes(&mut self, data: Vec<u8>, note: String) {
         match std::net::TcpStream::connect(("127.0.0.1", self.port)) {
             Ok(mut s) => {
                 use std::io::Write;
                 let _ = s.write_all(&data);
                 let _ = s.shutdown(std::net::Shutdown::Both);
-                self.msg = Some(format!(
-                    "Documento de prueba enviado a 127.0.0.1:{}",
-                    self.port
-                ));
+                self.msg = Some(note);
             }
-            Err(e) => self.msg = Some(format!("No se pudo enviar el documento de prueba: {e}")),
+            Err(e) => self.msg = Some(format!("No se pudo enviar el documento: {e}")),
         }
     }
 
@@ -281,6 +308,16 @@ impl EmuApp {
                         }
                     }
                     ui.separator();
+                    ui.label("Estado simulado:");
+                    {
+                        let mut s = self.state.lock().unwrap();
+                        ui.checkbox(&mut s.sim.paper_out, "Papel agotado");
+                        ui.checkbox(&mut s.sim.near_end, "Casi fin");
+                        ui.checkbox(&mut s.sim.cover_open, "Tapa abierta");
+                        ui.checkbox(&mut s.sim.error, "Error");
+                        ui.checkbox(&mut s.sim.drawer_open, "Cajón abierto");
+                    }
+                    ui.separator();
                     if ui
                         .add(
                             egui::Button::new(
@@ -292,6 +329,15 @@ impl EmuApp {
                         .clicked()
                     {
                         self.send_test();
+                    }
+                    if running {
+                        ui.separator();
+                        if ui.button("Feed").on_hover_text("Avance físico de papel (ESC J, ~12 mm)").clicked() {
+                            self.send_feed(100);
+                        }
+                        if ui.button("Corte").on_hover_text("Corte de papel (GS V 66)").clicked() {
+                            self.send_cut();
+                        }
                     }
                     ui.separator();
                     if ui.button("Registrar impresora en Windows").clicked() {
