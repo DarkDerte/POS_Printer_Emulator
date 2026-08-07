@@ -10,6 +10,13 @@ eframe = "0.35.0"
 encoding_rs = "0.8.35"
 font8x8 = "0.3.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+pdf417 = "0.2.1"
+qrcode = "0.14.1"
+
+[patch.crates-io]
+# pdf417 0.2.1 publica `#![feature(const_mut_refs)]` (estable desde 1.83);
+# se vende localmente sin esa línea para poder compilar en stable.
+pdf417 = { path = "vendor/pdf417" }
 
 [profile.release]
 opt-level = "z"     # optimizar para tamaño
