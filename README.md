@@ -47,7 +47,7 @@ cargo run --release
 
 El binario se genera en `target\release\pos_printer_emulator.exe` y no muestra ventana de consola.
 
-> Nota: la dependencia `pdf417` 0.2.1 se vende en `vendor/pdf417` (el crate publicado incluye `#![feature(const_mut_refs)]`, estable desde Rust 1.83, que rompe el compilador stable; se patchea localmente vía `[patch.crates-io]`).
+> Nota: la dependencia `pdf417` 0.2.1 se provee en `vendor/pdf417` (el crate publicado incluye `#![feature(const_mut_refs)]`, estable desde Rust 1.83, que rompe el compilador stable; se patchea localmente vía `[patch.crates-io]`).
 
 ## Pruebas
 
