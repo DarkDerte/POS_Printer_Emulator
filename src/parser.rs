@@ -26,6 +26,7 @@ pub struct Style {
     pub char_spacing: u8,
     pub size_x: u8,
     pub size_y: u8,
+    pub condensed: bool,
 }
 
 impl Default for Style {
@@ -41,6 +42,7 @@ impl Default for Style {
             char_spacing: 0,
             size_x: 1,
             size_y: 1,
+            condensed: false,
         }
     }
 }
@@ -81,6 +83,7 @@ pub struct BarcodeItem {
     pub data: Vec<u8>,
     pub height: u32,
     pub hri: u8,
+    pub hri_font: u8,
     pub module: u32,
 }
 
@@ -100,7 +103,7 @@ pub struct Barcode2DItem {
     pub rows: Option<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LogoItem {
     pub data: Vec<u8>,
     pub width: usize,
@@ -130,6 +133,8 @@ pub enum Item {
     MoveX(f32),
     SetLeftMargin(f32),
     SetPrintArea(PrintArea),
+    PageStart { width: f32, height: f32, dir: u8 },
+    PageEnd { height: f32 },
     StoreLogo(LogoItem),
     PrintLogo { scale_x: usize, scale_y: usize },
     Init,
@@ -141,6 +146,17 @@ pub struct ParsedDoc {
     pub summary: Vec<String>,
     pub transmit: Vec<Vec<u8>>,
     pub memory: PrinterMemory,
+    // Nº de veces que se debe imprimir el documento (GS # n).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub copies: u8,
+    // Solicita una página de auto-test (GS ( E fn=5).
+    pub auto_test: bool,
+    // Nº total de timbres solicitados por el zumbador (ESC ( C fn=0x06).
+    pub buzz: u32,
+    // Estado de los botones del panel tras ESC 8 / ESC c 5.
+    pub panel_enabled: bool,
+    // Mayor tiempo de pulso de cajón solicitado (ESC p / GS p), en ms.
+    pub drawer_pulse_ms: Option<u16>,
 }
 
 pub struct Parser {
@@ -151,20 +167,27 @@ pub struct Parser {
     codepage: Codepage,
     left_margin: i32,
     tabs: Vec<u8>,
+    skip_perforation: u8,
+    page_lines: u16,
+    user_font_active: bool,
     bar_module: u32,
     bar_height: u32,
     hri: u8,
+    hri_font: u8,
     items: Vec<Item>,
     summary: Vec<String>,
     transmit: Vec<Vec<u8>>,
     n_ignore: u32,
     fed_blank: bool,
+    kanji: bool,
     page_mode: bool,
     page_height: usize,
     page_dir: u8,
     logo: Option<LogoItem>,
+    logos: Vec<LogoItem>,
     density: u8,
     user_font: Vec<(u8, Vec<u8>)>,
+    user_kanji: Vec<(u16, Vec<u8>)>,
     qr_data: Vec<u8>,
     qr_module: u32,
     qr_ecc: u8,
@@ -173,6 +196,17 @@ pub struct Parser {
     pdf_cols: Option<u8>,
     pdf_rows: Option<u8>,
     pdf_ecc: Option<u8>,
+    model: crate::model::PrinterModel,
+    copies: u8,
+    auto_test: bool,
+    buzz: u32,
+    panel_enabled: bool,
+    right_margin: Option<i32>,
+    macro_bytes: Option<Vec<u8>>,
+    macro_depth: u8,
+    // Ajustes de fábrica (DIP) aplicados como valores por defecto.
+    auto_cut: bool,
+    hri_default: u8,
 }
 
 impl Default for Parser {
@@ -185,20 +219,27 @@ impl Default for Parser {
             codepage: Codepage::Cp437,
             left_margin: 0,
             tabs: Vec::new(),
+            skip_perforation: 0,
+            page_lines: 0,
+            user_font_active: false,
             bar_module: 2,
             bar_height: 50,
             hri: 0,
+            hri_font: 0,
             items: Vec::new(),
             summary: Vec::new(),
             transmit: Vec::new(),
             n_ignore: 0,
             fed_blank: false,
+            kanji: false,
             page_mode: false,
             page_height: 0,
             page_dir: 0,
             logo: None,
+            logos: Vec::new(),
             density: 0,
             user_font: Vec::new(),
+            user_kanji: Vec::new(),
             qr_data: Vec::new(),
             qr_module: 3,
             qr_ecc: 49,
@@ -207,6 +248,16 @@ impl Default for Parser {
             pdf_cols: None,
             pdf_rows: None,
             pdf_ecc: None,
+            model: crate::model::PrinterModel::EpsonTmT88V,
+            copies: 1,
+            auto_test: false,
+            buzz: 0,
+            panel_enabled: true,
+            right_margin: None,
+            macro_bytes: None,
+            macro_depth: 0,
+            auto_cut: true,
+            hri_default: 0,
         }
     }
 }
@@ -220,19 +271,110 @@ impl Parser {
     pub fn parse_with(data: &[u8], memory: &PrinterMemory) -> ParsedDoc {
         let mut p = Parser::default();
         p.logo = memory.logo.clone();
+        p.logos = memory.logos.clone();
         p.user_font = memory.user_font.clone();
+        p.user_kanji = memory.user_kanji.clone();
         p.density = memory.density;
+        p.macro_bytes = memory.macro_bytes.clone();
         p.run(data);
         p.flush_line();
+        p.finish()
+    }
+
+    /// Igual que `parse_with` pero fijando el perfil de modelo.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn parse_with_model(
+        data: &[u8],
+        memory: &PrinterMemory,
+        model: crate::model::PrinterModel,
+    ) -> ParsedDoc {
+        Self::parse_with_model_cp(data, memory, model, 0)
+    }
+
+    /// Igual que `parse_with_model` pero partiendo del codepage inicial del DIP.
+    pub fn parse_with_model_cp(
+        data: &[u8],
+        memory: &PrinterMemory,
+        model: crate::model::PrinterModel,
+        initial_cp: u8,
+    ) -> ParsedDoc {
+        let mut p = Parser::default();
+        p.model = model;
+        p.codepage = codepages::table(initial_cp);
+        p.logo = memory.logo.clone();
+        p.logos = memory.logos.clone();
+        p.user_font = memory.user_font.clone();
+        p.user_kanji = memory.user_kanji.clone();
+        p.density = memory.density;
+        p.macro_bytes = memory.macro_bytes.clone();
+        p.run(data);
+        p.flush_line();
+        p.finish()
+    }
+
+    /// Igual que `parse_with_model_cp` pero aplicando los ajustes DIP de fábrica:
+    /// la posición HRI por defecto (hri_below) y si hay cuchilla automática.
+    pub fn parse_with_dip(
+        data: &[u8],
+        memory: &PrinterMemory,
+        model: crate::model::PrinterModel,
+        initial_cp: u8,
+        hri_below: bool,
+        auto_cut: bool,
+    ) -> ParsedDoc {
+        let mut p = Parser::default();
+        p.model = model;
+        p.codepage = codepages::table(initial_cp);
+        p.logo = memory.logo.clone();
+        p.logos = memory.logos.clone();
+        p.user_font = memory.user_font.clone();
+        p.user_kanji = memory.user_kanji.clone();
+        p.density = memory.density;
+        p.macro_bytes = memory.macro_bytes.clone();
+        p.auto_cut = auto_cut;
+        p.hri_default = if hri_below { 2 } else { 0 };
+        p.hri = p.hri_default;
+        p.run(data);
+        p.flush_line();
+        p.finish()
+    }
+
+    // Construye el ParsedDoc final aplicando copias, resumen y estado mecánico.
+    fn finish(self) -> ParsedDoc {
+        let drawer_pulse_ms = self
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Drawer { t } => Some(*t as u16 * 2),
+                _ => None,
+            })
+            .max();
+        let mut items = self.items;
+        if self.copies > 1 {
+            let base = items;
+            let mut out = Vec::with_capacity(base.len() * self.copies as usize);
+            for _ in 0..self.copies {
+                out.extend(base.iter().cloned());
+            }
+            items = out;
+        }
         ParsedDoc {
-            items: p.items,
-            summary: p.summary,
-            transmit: p.transmit,
+            items,
+            summary: self.summary,
+            transmit: self.transmit,
             memory: PrinterMemory {
-                logo: p.logo,
-                user_font: p.user_font,
-                density: p.density,
+                logo: self.logo,
+                logos: self.logos,
+                user_font: self.user_font,
+                user_kanji: self.user_kanji,
+                density: self.density,
+                macro_bytes: self.macro_bytes,
             },
+            copies: self.copies,
+            auto_test: self.auto_test,
+            buzz: self.buzz,
+            panel_enabled: self.panel_enabled,
+            drawer_pulse_ms,
         }
     }
 
@@ -283,7 +425,25 @@ impl Parser {
                     self.handle_tab();
                     i += 1;
                 }
-                0x00 | 0x11 | 0x13 | 0x04 | 0x05 | 0x06 | 0x15 | 0x10 | 0x14 | 0x0B | 0x0F => {
+                0x0E => {
+                    // ESC SO: doble ancho
+                    self.flush_line();
+                    self.style.size_x = 2;
+                    i += 1;
+                }
+                0x0F => {
+                    // ESC SI: modo condensado
+                    self.flush_line();
+                    self.style.condensed = true;
+                    i += 1;
+                }
+                0x14 => {
+                    // ESC DC4: cancela doble ancho
+                    self.flush_line();
+                    self.style.size_x = 1;
+                    i += 1;
+                }
+                0x00 | 0x11 | 0x13 | 0x04 | 0x05 | 0x06 | 0x15 | 0x10 | 0x0B => {
                     i += 1;
                 }
                 b if (0x20..=0x7E).contains(&b) || b >= 0x80 => {
@@ -296,6 +456,31 @@ impl Parser {
                                 self.push_utf8(s);
                                 i += len;
                                 continue;
+                            }
+                        }
+                    }
+                    if self.kanji && codepages::kanji_lead(b) {
+                        if let Some(&t) = data.get(i + 1) {
+                            if codepages::kanji_trail(t) {
+                                if let Some(s) = codepages::decode_kanji_pair(b, t) {
+                                    self.push_utf8(&s);
+                                    i += 2;
+                                    continue;
+                                }
+                            }
+                        }
+                    } else if codepages::is_double_byte(self.codepage)
+                        && codepages::is_lead(self.codepage, b)
+                    {
+                        if let Some(&t) = data.get(i + 1) {
+                            if codepages::is_trail(self.codepage, t) {
+                                if let Some(s) =
+                                    codepages::decode_pair(self.codepage, b, t)
+                                {
+                                    self.push_utf8(&s);
+                                    i += 2;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -372,12 +557,17 @@ impl Parser {
         self.codepage = Codepage::Cp437;
         self.left_margin = 0;
         self.tabs.clear();
+        self.skip_perforation = 0;
+        self.page_lines = 0;
+        self.user_font_active = false;
         self.bar_module = 2;
         self.bar_height = 50;
-        self.hri = 0;
+        self.hri = self.hri_default;
+        self.hri_font = 0;
         self.page_mode = false;
         self.page_height = 0;
         self.page_dir = 0;
+        self.kanji = false;
         self.qr_data.clear();
         self.qr_module = 3;
         self.qr_ecc = 49;
@@ -386,6 +576,23 @@ impl Parser {
         self.pdf_cols = None;
         self.pdf_rows = None;
         self.pdf_ecc = None;
+        self.copies = 1;
+        self.right_margin = None;
+        self.panel_enabled = true;
+    }
+
+    /// Emite una orden de corte; si el DIP de auto-corte está desactivado (sin
+    /// cuchilla instalada) solo se registra el avance sin dibujar la línea.
+    fn push_cut(&mut self, partial: bool) {
+        if self.auto_cut {
+            self.push(Item::Cut { partial });
+        } else {
+            self.summary.push(format!(
+                "Corte {} ignorado: cuchilla automática desactivada (DIP)",
+                if partial { "parcial" } else { "total" }
+            ));
+            self.push(Item::FeedDots(12));
+        }
     }
 
     fn handle_esc(&mut self, data: &[u8], i: usize) -> usize {
@@ -481,9 +688,7 @@ impl Parser {
             b'v' => {
                 if let Some(n) = get(2) {
                     self.flush_line();
-                    self.push(Item::Cut {
-                        partial: n != 0 && n != 48,
-                    });
+                    self.push_cut(n != 0 && n != 48);
                     i + 3
                 } else {
                     usize::MAX
@@ -494,12 +699,55 @@ impl Parser {
                 i + 2
             }
             b'7' => {
-                self.summary.push("ESC 7 (modo página) ignorado".to_string());
+                // ESC 7: selecciona la fuente descargada por el usuario
+                self.user_font_active = true;
+                self.summary.push("ESC 7: fuente de usuario seleccionada".to_string());
                 i + 2
             }
-            b'8' => {
-                self.summary.push("ESC 8 (desactivación de página) ignorado".to_string());
+            b'6' => {
+                // ESC 6: selecciona la fuente interna (default)
+                self.user_font_active = false;
+                self.summary.push("ESC 6: fuente interna seleccionada".to_string());
                 i + 2
+            }
+            b'\x14' => {
+                // ESC DC4: cancela el doble ancho
+                self.flush_line();
+                self.style.size_x = 1;
+                i + 2
+            }
+            b'N' => {
+                // ESC N n: punto de salto de perforación
+                if let Some(n) = get(2) {
+                    self.skip_perforation = n;
+                    self.summary.push(format!("ESC N: salto de perforación {n} líneas"));
+                    i + 3
+                } else {
+                    usize::MAX
+                }
+            }
+            b'C' => {
+                // ESC C n: longitud de página en líneas
+                if let Some(n) = get(2) {
+                    self.page_lines = n as u16;
+                    self.summary.push(format!("ESC C: longitud de página {n} líneas"));
+                    i + 3
+                } else {
+                    usize::MAX
+                }
+            }
+            b'8' => {
+                // ESC 8 n: activa/desactiva los botones del panel
+                if let Some(n) = get(2) {
+                    self.panel_enabled = n != 0;
+                    self.summary.push(format!(
+                        "ESC 8: botones de panel {}",
+                        if n != 0 { "activados" } else { "desactivados" }
+                    ));
+                    i + 3
+                } else {
+                    usize::MAX
+                }
             }
             b'a' => {
                 if let Some(n) = get(2) {
@@ -549,7 +797,9 @@ impl Parser {
                 self.flush_line();
                 if self.page_mode {
                     self.summary.push("Modo página impreso (ESC FF)".to_string());
-                    self.push(Item::FeedDots(self.page_height as u32));
+                    self.push(Item::PageEnd {
+                        height: self.page_height as f32,
+                    });
                     self.page_mode = false;
                 } else {
                     self.push(Item::FeedLines(1));
@@ -583,20 +833,18 @@ impl Parser {
             b'i' => {
                 self.flush_line();
                 self.push(Item::FeedDots(6));
-                self.push(Item::Cut { partial: false });
+                self.push_cut(false);
                 i + 2
             }
             b'm' => {
                 self.flush_line();
-                self.push(Item::Cut { partial: true });
+                self.push_cut(true);
                 i + 2
             }
             b'V' => {
                 if let Some(n) = get(2) {
                     self.flush_line();
-                    self.push(Item::Cut {
-                        partial: n != 0 && n != 48,
-                    });
+                    self.push_cut(n != 0 && n != 48);
                     i + 3
                 } else {
                     usize::MAX
@@ -694,8 +942,17 @@ impl Parser {
                 }
             }
             b'Q' => {
-                if let (Some(_a), Some(_b)) = (get(2), get(3)) {
-                    self.summary.push("ESC Q (margen derecho) ignorado".to_string());
+                if let (Some(a), Some(b)) = (get(2), get(3)) {
+                    self.right_margin = Some((a as i32) + (b as i32) * 256);
+                    self.flush_line();
+                    let width = ((self.right_margin.unwrap() as f32) - (self.left_margin as f32))
+                        .max(0.0);
+                    self.push(Item::SetPrintArea(PrintArea {
+                        left: self.left_margin as f32,
+                        width,
+                    }));
+                    self.summary
+                        .push(format!("ESC Q: margen derecho {} (área {width:.0} px)", self.right_margin.unwrap()));
                     i + 4
                 } else {
                     usize::MAX
@@ -703,8 +960,30 @@ impl Parser {
             }
             b'c' => {
                 if let Some(n) = get(2) {
-                    self.summary.push(format!("Selector ESC c n={n} ignorado"));
-                    i + 3
+                    if n == 5 {
+                        // ESC c 5 n: activa/desactiva los botones del panel
+                        let valor = get(3).unwrap_or(0);
+                        self.panel_enabled = valor != 0;
+                        self.summary.push(format!(
+                            "ESC c 5: botones de panel {}",
+                            if valor != 0 { "activados" } else { "desactivados" }
+                        ));
+                        i + 4
+                    } else {
+                        match n {
+                            3 => self.summary.push(
+                                "ESC c 3: sensor de papel para detener la impresión".to_string(),
+                            ),
+                            4 => self.summary.push(
+                                "ESC c 4: sensor de papel que emite señal de fin de papel".to_string(),
+                            ),
+                            6 => self.summary.push(
+                                "ESC c 6: sensor de papel para detener impresión (2)".to_string(),
+                            ),
+                            _ => self.summary.push(format!("Selector ESC c n={n}")),
+                        }
+                        i + 3
+                    }
                 } else {
                     usize::MAX
                 }
@@ -733,13 +1012,28 @@ impl Parser {
                     usize::MAX
                 }
             }
+            b'u' => {
+                // ESC u n: estado de periféricos (cajón). Lo responde el servidor
+                // en tiempo real porque depende del estado físico actual.
+                if let Some(n) = get(2) {
+                    self.summary
+                        .push(format!("ESC u {n}: estado de periférico transmitido"));
+                    i + 3
+                } else {
+                    usize::MAX
+                }
+            }
             b'(' => {
                 if let (Some(m), Some(nl), Some(nh)) = (get(2), get(3), get(4)) {
                     let len = nl as u32 + nh as u32 * 256;
                     if m == b'C' && get(5) == Some(0x06) {
-                        // ESC ( C pL pH 06 n m t: zumbador (buzzer)
+                        // ESC ( C pL pH 06 n m t: zumbador. n = nº de timbres.
+                        let n = get(6).unwrap_or(1);
+                        let cyc = get(7).unwrap_or(0);
+                        let t = get(8).unwrap_or(0);
+                        self.buzz = self.buzz.max(n as u32);
                         self.summary.push(format!(
-                            "Buzzer activado (ESC ( C fn=0x06, {len} bytes)"
+                            "Buzzer ESC ( C fn=0x06: {n} timbre(s), ciclo {cyc}, t={t} ({len} bytes)"
                         ));
                     } else {
                         self.summary.push(format!(
@@ -849,7 +1143,7 @@ impl Parser {
                 if let Some(n) = get(2) {
                     self.flush_line();
                     let partial = n != 0 && n != 48;
-                    self.push(Item::Cut { partial });
+                    self.push_cut(partial);
                     if n == 66 || n == 67 {
                         if let Some(feed) = get(3) {
                             self.push(Item::FeedLines(feed as u32));
@@ -917,22 +1211,33 @@ impl Parser {
             }
             b'k' => {
                 if let Some(m) = get(2) {
-                    if (65..=73).contains(&m) {
+                    let norm_m = match m {
+                        0 => 65,
+                        1 => 66,
+                        2 => 67,
+                        3 => 68,
+                        4 => 69,
+                        5 => 70,
+                        6 => 71,
+                        other => other,
+                    };
+                    if (65..=73).contains(&norm_m) {
                         let mut j = i + 3;
                         while j < data.len() && data[j] != 0 {
                             j += 1;
                         }
                         if j < data.len() {
                             let bytes = data[i + 3..j].to_vec();
-                            let (norm, warn) = crate::barcode::validate(m, &bytes);
+                            let (norm, warn) = crate::barcode::validate(norm_m, &bytes);
                             if let Some(w) = warn {
                                 self.summary.push(w);
                             }
                             self.flush_line();
                             self.push(Item::Barcode(BarcodeItem {
-                                m,
+                                m: norm_m,
                                 data: norm,
                                 hri: self.hri,
+                                hri_font: self.hri_font,
                                 module: self.bar_module,
                                 height: self.bar_height,
                             }));
@@ -944,15 +1249,16 @@ impl Parser {
                         let len = n as usize;
                         if i + 4 + len <= data.len() {
                             let bytes = data[i + 4..i + 4 + len].to_vec();
-                            let (norm, warn) = crate::barcode::validate(m, &bytes);
+                            let (norm, warn) = crate::barcode::validate(norm_m, &bytes);
                             if let Some(w) = warn {
                                 self.summary.push(w);
                             }
                             self.flush_line();
                             self.push(Item::Barcode(BarcodeItem {
-                                m,
+                                m: norm_m,
                                 data: norm,
                                 hri: self.hri,
+                                hri_font: self.hri_font,
                                 module: self.bar_module,
                                 height: self.bar_height,
                             }));
@@ -976,7 +1282,8 @@ impl Parser {
                 }
             }
             b'f' => {
-                if let Some(_n) = get(2) {
+                if let Some(n) = get(2) {
+                    self.hri_font = n & 0x01;
                     i + 3
                 } else {
                     usize::MAX
@@ -1006,6 +1313,62 @@ impl Parser {
                     usize::MAX
                 }
             }
+            b'#' => {
+                // GS # n: nº de copias del siguiente documento
+                if let Some(n) = get(2) {
+                    self.copies = n.max(1);
+                    self.summary.push(format!("GS #: {n} copia(s)"));
+                    i + 3
+                } else {
+                    usize::MAX
+                }
+            }
+            b':' => {
+                // GS : pL pH m n d1..dk: define la macro
+                if let (Some(p_l), Some(p_h)) = (get(2), get(3)) {
+                    let len = p_l as usize + p_h as usize * 256;
+                    let m = get(4).unwrap_or(0);
+                    let total = i + 4 + len;
+                    if total > data.len() {
+                        usize::MAX
+                    } else if m == 1 {
+                        self.macro_bytes = Some(data[i + 6..i + 4 + len].to_vec());
+                        self.summary.push(format!(
+                            "Macro definida (GS :): {} bytes almacenados",
+                            len.saturating_sub(2)
+                        ));
+                        total
+                    } else {
+                        self.summary.push(format!("GS : modo m={m} ignorado"));
+                        total
+                    }
+                } else {
+                    usize::MAX
+                }
+            }
+            b'^' => {
+                // GS ^ r t m: ejecuta la macro r veces
+                if let (Some(r), Some(t)) = (get(2), get(3)) {
+                    let mut n = 0;
+                    for _ in 0..r.max(1) {
+                        self.run_macro();
+                        n += 1;
+                    }
+                    self.summary.push(format!(
+                        "Macro ejecutada (GS ^): {n} vez/veces (espera t={t})"
+                    ));
+                    i + 5
+                } else {
+                    usize::MAX
+                }
+            }
+            b'I' => {
+                // GS I n: identificación de la impresora (ID del fabricante/modelo)
+                let _n = get(2);
+                self.transmit.push(self.model.id_string().as_bytes().to_vec());
+                self.summary.push(format!("GS I: ID \"{}\" transmitido", self.model.id_string()));
+                i + 3
+            }
             b'P' => {
                 if let (Some(xl), Some(xh), Some(yl), Some(yh)) =
                     (get(2), get(3), get(4), get(5))
@@ -1019,7 +1382,15 @@ impl Parser {
                         left: self.left_margin as f32,
                         width: w as f32,
                     }));
-                    self.summary.push(format!("Modo página GS P ({w}x{h}) activado"));
+                    self.push(Item::PageStart {
+                        width: w as f32,
+                        height: h as f32,
+                        dir: self.page_dir,
+                    });
+                    self.summary.push(format!(
+                        "Modo página GS P ({w}x{h}) activado (dirección {})",
+                        self.page_dir
+                    ));
                     i + 6
                 } else {
                     usize::MAX
@@ -1027,11 +1398,9 @@ impl Parser {
             }
             b'T' => {
                 if let Some(n) = get(2) {
-                    self.page_dir = n;
-                    if n != 0 {
-                        self.summary
-                            .push(format!("GS T dirección {n}: no soportada, se usa 0"));
-                    }
+                    self.page_dir = n & 0x03;
+                    self.summary
+                        .push(format!("GS T dirección {}", self.page_dir));
                     i + 3
                 } else {
                     usize::MAX
@@ -1233,32 +1602,120 @@ impl Parser {
                                 self.summary.push("GS ( L fn=48: datos de logo inválidos".to_string());
                             }
                         } else if a == 49 {
-                            self.logo = None;
-                            self.summary.push("Logo NV borrado (GS ( L fn=48 a=49)".to_string());
+                            self.clear_logos();
+                            self.summary.push("Logos NV borrados (GS ( L fn=48 a=49)".to_string());
                         } else {
                             self.summary.push(format!("GS ( L fn=48 a={a} ignorado"));
                         }
                     }
+                    49 => {
+                        // GS ( L fn=49 n1: nº de gráficos NV en la animación
+                        if let Some(n) = get(7) {
+                            self.summary
+                                .push(format!("Animación: {n} gráficos NV por ciclo"));
+                        }
+                    }
+                    50 => {
+                        // GS ( L fn=50 n1: fotogramas por segundo de la animación
+                        if let Some(n) = get(7) {
+                            self.summary
+                                .push(format!("Animación: {n} fotogramas/segundo"));
+                        }
+                    }
+                    51 => {
+                        // GS ( L fn=51 xL xH: posición inicial de la animación
+                        let x = n16(7);
+                        self.summary
+                            .push(format!("Animación: posición inicial x={x}"));
+                    }
+                    52 => {
+                        // GS ( L fn=52 a: definir un gráfico NV para animación
+                        let a = get(7).unwrap_or(0);
+                        if a == 48 {
+                            let r = n16(8);
+                            let x_bytes = n16(10);
+                            let height = n16(12);
+                            let ds = i + 14;
+                            if x_bytes > 0 && height > 0 && r >= 4 && ds + x_bytes * height <= total {
+                                self.store_logo(data[ds..ds + x_bytes * height].to_vec(), x_bytes * 8, height);
+                                self.summary.push(format!(
+                                    "Gráfico de animación almacenado ({x_bytes} bytes x {height})"
+                                ));
+                            }
+                        } else if a == 49 {
+                            self.clear_logos();
+                            self.summary.push("Gráficos de animación borrados".to_string());
+                        }
+                    }
+                    53 => {
+                        // GS ( L fn=53 k: nº de gráficos que se definirán
+                        if let Some(k) = get(7) {
+                            self.summary.push(format!("Animación: se definirán {k} gráficos"));
+                        }
+                    }
                     65 | 66 => {
-                        self.push_print_logo(1, 1);
+                        if fn_ == 66 {
+                            self.push_print_all_logos();
+                        } else {
+                            self.push_print_logo_num(1, 1, 1);
+                        }
                     }
                     73 | 74 | 75 => {
-                        let n = if self.logo.is_some() { 1 } else { 0 };
-                        self.summary.push(format!("GS ( L fn={fn_} verificación: {n} logo(s)"));
+                        let n = self.logos.len().min(32) as u8;
+                        self.transmit.push(vec![n]);
+                        self.summary.push(format!(
+                            "GS ( L fn={fn_} verificación: {n} logo(s) -> transmitido"
+                        ));
                     }
                     _ => {
                         self.summary.push(format!("GS ( L fn={fn_:#x} ignorado"));
                     }
                 }
             }
-             0x45 => {
-                if fn_ == 3 {
-                    if let Some(n) = get(7) {
-                        self.density = n;
-                        self.summary.push(format!("Densidad de impresión GS ( E: {n}"));
+             0x4B => {
+                // GS ( K : identificación de la impresora
+                match fn_ {
+                    65 => {
+                        self.transmit.push(self.model.id_string().as_bytes().to_vec());
+                        self.summary.push("GS ( K fn=65: modelo transmitido".to_string());
                     }
-                } else {
-                    self.summary.push("GS ( E (densidad de impresión) ignorado".to_string());
+                    66 => {
+                        self.transmit.push(self.model.firmware().as_bytes().to_vec());
+                        self.summary.push("GS ( K fn=66: firmware transmitido".to_string());
+                    }
+                    67 => {
+                        self.transmit.push(self.model.serial().as_bytes().to_vec());
+                        self.summary.push("GS ( K fn=67: serie transmitida".to_string());
+                    }
+                    _ => {
+                        self.summary.push(format!("GS ( K fn={fn_:#x} ignorado"));
+                    }
+                }
+            }
+             0x45 => {
+                // GS ( E : control de impresión (densidad, auto-test)
+                match fn_ {
+                    2 => {
+                        // fn=2: transmitir densidad de impresión
+                        self.transmit.push(vec![self.density]);
+                        self.summary
+                            .push(format!("GS ( E fn=2: densidad {} transmitida", self.density));
+                    }
+                    3 => {
+                        // fn=3: fijar densidad de impresión
+                        if let Some(n) = get(7) {
+                            self.density = n;
+                            self.summary.push(format!("Densidad de impresión GS ( E: {n}"));
+                        }
+                    }
+                    5 => {
+                        // fn=5: imprimir página de auto-test
+                        self.auto_test = true;
+                        self.summary.push("GS ( E fn=5: auto-test solicitado".to_string());
+                    }
+                    _ => {
+                        self.summary.push(format!("GS ( E fn={fn_:#x} ignorado"));
+                    }
                 }
             }
              0x41 => {
@@ -1295,6 +1752,22 @@ impl Parser {
         total
     }
 
+    // Ejecuta la macro definida con GS : (bytes ESC/POS re-parseados en el
+    // contexto actual, con guarda de profundidad para evitar recursión).
+    fn run_macro(&mut self) {
+        if self.macro_depth >= 4 {
+            self.summary.push("Macro: recursión máxima alcanzada".to_string());
+            return;
+        }
+        let Some(bytes) = self.macro_bytes.clone() else {
+            self.summary.push("Macro (GS ^): no hay macro definida".to_string());
+            return;
+        };
+        self.macro_depth += 1;
+        self.run(&bytes);
+        self.macro_depth -= 1;
+    }
+
     fn push_2d(&mut self, kind: Barcode2DKind) {
         let (data, module, ecc, cols, rows) = match kind {
             Barcode2DKind::Qr => (self.qr_data.clone(), self.qr_module, self.qr_ecc, None, None),
@@ -1323,9 +1796,19 @@ impl Parser {
 
     fn store_logo(&mut self, data: Vec<u8>, width: usize, height: usize) {
         let l = LogoItem { data, width, height };
+        if self.logos.len() < 32 {
+            self.logos.push(l.clone());
+        } else {
+            self.summary.push("Capacidad NV de logos agotada (32 máx)".to_string());
+        }
         self.logo = Some(l.clone());
         self.flush_line();
         self.push(Item::StoreLogo(l));
+    }
+
+    fn clear_logos(&mut self) {
+        self.logo = None;
+        self.logos.clear();
     }
 
     // Imprime el logo almacenado (en memoria o en la memoria NV persistente).
@@ -1337,6 +1820,35 @@ impl Parser {
         } else {
             self.summary
                 .push("Impresión de logo: no hay logo NV almacenado".to_string());
+        }
+    }
+
+    // Imprime el logo número `num` (1-based) de los almacenados en NV.
+    fn push_print_logo_num(&mut self, num: usize, scale_x: usize, scale_y: usize) {
+        let Some(l) = self.logos.get(num.saturating_sub(1)).cloned() else {
+            self.summary.push(format!(
+                "Impresión de logo #{num}: no existe ({} almacenados)",
+                self.logos.len()
+            ));
+            return;
+        };
+        self.logo = Some(l.clone());
+        self.flush_line();
+        self.push(Item::StoreLogo(l));
+        self.push(Item::PrintLogo { scale_x, scale_y });
+    }
+
+    // Imprime todos los logos almacenados en secuencia (animación).
+    fn push_print_all_logos(&mut self) {
+        if self.logos.is_empty() {
+            self.summary
+                .push("Animación: no hay logos NV almacenados".to_string());
+            return;
+        }
+        self.flush_line();
+        for l in self.logos.iter().cloned().collect::<Vec<_>>() {
+            self.push(Item::StoreLogo(l.clone()));
+            self.push(Item::PrintLogo { scale_x: 1, scale_y: 1 });
         }
     }
 
@@ -1353,7 +1865,7 @@ impl Parser {
                     return usize::MAX;
                 };
                 let mut j = i + 3;
-                let mut stored = false;
+                let mut stored = 0;
                 let count = n.max(1) as usize;
                 for _ in 0..count {
                     if j + 4 > data.len() {
@@ -1366,30 +1878,139 @@ impl Parser {
                     if j + dlen > data.len() {
                         break;
                     }
-                    if !stored && wb > 0 && h > 0 {
+                    if wb > 0 && h > 0 {
                         self.summary.push(format!(
-                            "Logo NV almacenado via FS q ({wb} bytes x {h})"
+                            "Logo NV {} almacenado via FS q ({wb} bytes x {h})",
+                            stored + 1
                         ));
                         self.store_logo(data[j..j + dlen].to_vec(), wb * 8, h);
-                        stored = true;
+                        stored += 1;
                     }
                     j += dlen;
                 }
                 j
             }
             b'p' => {
-                if let Some(_n) = get(2) {
-                    let m = get(3).unwrap_or(0);
+                // FS p n m: imprime el logo nº m (1-based) con escala según m
+                if let (Some(_n), Some(m)) = (get(2), get(3)) {
                     let (sx, sy) = logo_scale(m);
-                    self.push_print_logo(sx, sy);
+                    if m == 0 {
+                        self.push_print_logo(sx, sy);
+                    } else {
+                        self.push_print_logo_num(m as usize, sx, sy);
+                    }
                     i + 4
                 } else {
                     usize::MAX
                 }
             }
-            b'&' | b'"' => {
-                self.summary.push(format!("Kanji FS {} ignorado", cmd as char));
-                i + 3
+            b'&' => {
+                // FS & : selecciona modo kanji (Shift-JIS)
+                self.kanji = true;
+                self.summary.push("Modo kanji activado (FS &)".to_string());
+                i + 2
+            }
+            b'.' => {
+                // FS . : cancela modo kanji
+                self.kanji = false;
+                self.summary.push("Modo kanji cancelado (FS .)".to_string());
+                i + 2
+            }
+            b'2' => {
+                // FS 2 C1 C2 d1..d32: define kanji de usuario
+                if let (Some(c1), Some(c2)) = (get(2), get(3)) {
+                    let start = i + 4;
+                    if start + 32 <= data.len() {
+                        let code = c1 as u16 + (c2 as u16) * 256;
+                        self.user_kanji
+                            .push((code, data[start..start + 32].to_vec()));
+                        self.summary.push(format!(
+                            "Kanji de usuario FS 2 {:#06x} (32 bytes) almacenado",
+                            code
+                        ));
+                        i + 36
+                    } else {
+                        usize::MAX
+                    }
+                } else {
+                    usize::MAX
+                }
+            }
+            b'"' => {
+                // FS " C1 C2 d1..d32: define kanji de usuario (alternativa a FS 2)
+                if let (Some(c1), Some(c2)) = (get(2), get(3)) {
+                    let start = i + 4;
+                    if start + 32 <= data.len() {
+                        let code = c1 as u16 + (c2 as u16) * 256;
+                        self.user_kanji
+                            .push((code, data[start..start + 32].to_vec()));
+                        self.summary.push(format!(
+                            "Kanji de usuario FS \" {:#06x} (32 bytes) almacenado",
+                            code
+                        ));
+                        i + 36
+                    } else {
+                        usize::MAX
+                    }
+                } else {
+                    usize::MAX
+                }
+            }
+            b'!' => {
+                // FS ! n: modo impresión kanji (mismo formato que GS !)
+                if let Some(n) = get(2) {
+                    let sx = (n & 0x0F).max(1);
+                    let sy = ((n >> 4) & 0x0F).max(1);
+                    self.style.size_x = sx;
+                    self.style.size_y = sy;
+                    self.summary
+                        .push(format!("Modo kanji FS ! n={n:#04x}"));
+                    i + 3
+                } else {
+                    usize::MAX
+                }
+            }
+            b'-' => {
+                // FS - n: subrayado en modo kanji
+                if let Some(n) = get(2) {
+                    self.style.underline = n & 0x01 != 0 || n & 0x02 != 0;
+                    self.style.underline2 = n & 0x02 != 0;
+                    i + 3
+                } else {
+                    usize::MAX
+                }
+            }
+            b'/' => {
+                // FS / n: espaciado vertical del texto kanji
+                if let Some(_n) = get(2) {
+                    i + 3
+                } else {
+                    usize::MAX
+                }
+            }
+            b'S' => {
+                // FS S n1 n2: espacio entre caracteres kanji (n1 izq, n2 der)
+                if let (Some(_a), Some(_b)) = (get(2), get(3)) {
+                    i + 4
+                } else {
+                    usize::MAX
+                }
+            }
+            b'$' => {
+                // FS $ nL nH: espacio lateral de caracteres kanji
+                if let (Some(_a), Some(_b)) = (get(2), get(3)) {
+                    i + 4
+                } else {
+                    usize::MAX
+                }
+            }
+            b'W' => {
+                // FS W nL nH: ancho del área de impresión kanji
+                if let (Some(_a), Some(_b)) = (get(2), get(3)) {
+                    i + 4
+                } else {
+                    usize::MAX
+                }
             }
             _ => {
                 self.summary.push(format!("Comando FS {:#04x} no soportado", cmd));
@@ -1724,6 +2345,30 @@ mod tests {
     }
 
     #[test]
+    fn direccion_pagina_gs_t() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0x1D, 0x54, 0x02]); // GS T dir 2
+        d.extend_from_slice(&[0x1D, 0x50]);
+        d.extend_from_slice(&(576u16).to_le_bytes());
+        d.extend_from_slice(&(300u16).to_le_bytes());
+        d.extend_from_slice(b"X\n");
+        d.extend_from_slice(&[0x1B, 0x0C]);
+        let doc = Parser::parse(&d);
+        assert!(
+            doc.items
+                .iter()
+                .any(|it| matches!(it, Item::PageStart { dir: 2, .. })),
+            "esperaba Item::PageStart con dirección 2"
+        );
+        assert!(
+            doc.items
+                .iter()
+                .any(|it| matches!(it, Item::PageEnd { .. })),
+            "esperaba Item::PageEnd"
+        );
+    }
+
+    #[test]
     fn transmitir_qr_y_pdf417_fn_81() {
         let mut d = Vec::new();
         let qr = b"tx-data";
@@ -1749,5 +2394,328 @@ mod tests {
         let doc = Parser::parse(&d);
         assert!(doc.summary.iter().any(|s| s.contains("Buzzer")));
         assert!(doc.summary.iter().any(|s| s.contains("Fuente descargada")));
+    }
+
+    #[test]
+    fn kanji_fs_amp_y_fs_punto() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0x1C, 0x26]); // FS & -> modo kanji
+        d.extend_from_slice(&[0x88, 0x9F]); // "亜" en Shift-JIS
+        d.push(0x0A);
+        d.extend_from_slice(&[0x1C, 0x2E]); // FS . -> cancela kanji
+        d.extend_from_slice(&[0x88, 0x9F, 0x0A]); // ahora es texto CP437
+        let doc = Parser::parse(&d);
+        let texts: Vec<_> = doc
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Text(t) => Some(t.runs.iter().map(|r| r.text.clone()).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts[0].concat(), "亜");
+        assert_eq!(texts[1].concat(), "êƒ"); // 0x88/0x9F CP437 sin modo kanji
+        assert!(doc.summary.iter().any(|s| s.contains("Modo kanji activado")));
+        assert!(doc.summary.iter().any(|s| s.contains("Modo kanji cancelado")));
+    }
+
+    #[test]
+    fn codepage_multibyte_esc_t_81() {
+        let mut d = Vec::new();
+        push_esc(&mut d, b't');
+        d.push(81); // Shift-JIS
+        d.extend_from_slice(&[0x82, 0xA0]); // "あ" en Shift-JIS
+        d.extend_from_slice(&[0x88, 0x9F]); // "亜"
+        d.push(0x0A);
+        let doc = Parser::parse(&d);
+        let texts: Vec<_> = doc
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Text(t) => Some(t.runs.iter().map(|r| r.text.clone()).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts[0].concat(), "あ亜");
+    }
+
+    #[test]
+    fn codepage_1251_cirilico() {
+        let mut d = Vec::new();
+        push_esc(&mut d, b't');
+        d.push(85); // WPC1251
+        d.extend_from_slice(&[0xC0, 0xE0, 0x0A]); // "Аа"
+        let doc = Parser::parse(&d);
+        let Item::Text(t) = &doc.items[0] else {
+            panic!("esperaba texto");
+        };
+        assert_eq!(t.runs[0].text, "Аа");
+    }
+
+    #[test]
+    fn fs_2_define_kanji_usuario() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0x1C, 0x32]); // FS 2
+        d.extend_from_slice(&[0x88, 0x9F]);
+        d.extend_from_slice(&[0u8; 32]);
+        let doc = Parser::parse(&d);
+        assert!(doc.summary.iter().any(|s| s.contains("Kanji de usuario")));
+        assert_eq!(doc.memory.user_kanji, vec![(0x9F88, vec![0u8; 32])]);
+    }
+
+    #[test]
+    fn multi_logo_gs_l_y_fs_p_numero() {
+        let mut d = Vec::new();
+        // Definir k=2 logos vía GS ( L fn=48 a=48; r = nº de bytes de datos
+        let mut seq = Vec::new();
+        for (w, h, fill) in [(2u16, 2u16, 0xA5u8), (2, 4, 0x5A)] {
+            let r = w * h;
+            seq.extend_from_slice(&r.to_le_bytes());
+            seq.extend_from_slice(&w.to_le_bytes());
+            seq.extend_from_slice(&h.to_le_bytes());
+            seq.extend_from_slice(&vec![fill; r as usize]);
+        }
+        d.extend_from_slice(&[0x1D, 0x28, 0x4C]);
+        d.push(0); // pL (se rellena abajo)
+        d.push(0); // pH
+        d.extend_from_slice(&[0x4C, 0x30, 0x30, 2]); // cn=L fn=48 a=48 k=2
+        d.extend_from_slice(&seq);
+        let p_l = (seq.len() + 4) as u8; // cn fn a k
+        d[3] = p_l;
+        // FS p n=1 m=2: imprime el logo 2
+        d.extend_from_slice(&[0x1C, 0x70, 0x01, 0x02]);
+        let doc = Parser::parse(&d);
+        assert_eq!(doc.memory.logos.len(), 2);
+        assert_eq!(doc.memory.logos[1].height, 4);
+        let prints = doc
+            .items
+            .iter()
+            .filter(|it| matches!(it, Item::PrintLogo { .. }))
+            .count();
+        assert_eq!(prints, 1, "esperaba una sola impresión de logo");
+        let last_store = doc
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::StoreLogo(l) => Some(l.height),
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        assert_eq!(last_store, 4, "el último StoreLogo debe ser el logo 2");
+    }
+
+    #[test]
+    fn gs_l_fn73_transmite_conteo() {
+        let mut d = Vec::new();
+        let mut seq = Vec::new();
+        seq.extend_from_slice(&4u16.to_le_bytes()); // r = datos
+        seq.extend_from_slice(&2u16.to_le_bytes());
+        seq.extend_from_slice(&2u16.to_le_bytes());
+        seq.extend_from_slice(&[0u8; 4]);
+        d.extend_from_slice(&[0x1D, 0x28, 0x4C]);
+        d.push(0);
+        d.push(0);
+        d.extend_from_slice(&[0x4C, 0x30, 0x30, 1]);
+        d.extend_from_slice(&seq);
+        let p_l = (seq.len() + 4) as u8;
+        d[3] = p_l;
+        // GS ( L fn=73: transmite el número de logos
+        d.extend_from_slice(&[0x1D, 0x28, 0x4C, 0x01, 0x00, 0x4C, 0x49]);
+        let doc = Parser::parse(&d);
+        assert_eq!(doc.memory.logos.len(), 1);
+        assert_eq!(doc.transmit, vec![vec![1u8]]);
+    }
+
+    #[test]
+    fn identificacion_gs_i_y_gs_k_por_modelo() {
+        use crate::model::PrinterModel;
+        // GS I n: devuelve el ID del modelo
+        let doc = Parser::parse_with_model(
+            &[0x1D, 0x49, 0x01],
+            &PrinterMemory::default(),
+            PrinterModel::XprinterXp80,
+        );
+        assert_eq!(doc.transmit, vec![b"XP-T80".to_vec()]);
+        // GS ( K fn=65/66/67: modelo, firmware y serie
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0x1D, 0x28, 0x4B, 0x02, 0x00, 0x4B, 0x41]); // fn=65 modelo
+        d.extend_from_slice(&[0x1D, 0x28, 0x4B, 0x02, 0x00, 0x4B, 0x42]); // fn=66 firmware
+        d.extend_from_slice(&[0x1D, 0x28, 0x4B, 0x02, 0x00, 0x4B, 0x43]); // fn=67 serie
+        let doc = Parser::parse_with_model(&d, &PrinterMemory::default(), PrinterModel::CitizenCtS310);
+        assert_eq!(
+            doc.transmit,
+            vec![b"CT-S310".to_vec(), b"1.05".to_vec(), b"CTS31012345".to_vec()]
+        );
+    }
+
+    #[test]
+    fn hri_posicion_y_fuente_gs_h_f() {
+        // GS H n (posición) + GS f n (fuente) + GS k m datos
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0x1D, 0x48, 0x03]); // HRI encima y debajo
+        d.extend_from_slice(&[0x1D, 0x66, 0x01]); // HRI fuente B
+        d.extend_from_slice(&[0x1D, 0x6B, 0x02, b'1', b'2', 0x00]); // Code39 "12"
+        let doc = Parser::parse(&d);
+        let b = doc
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Barcode(b) => Some(b),
+                _ => None,
+            })
+            .expect("esperaba un código de barras");
+        assert_eq!(b.hri, 3);
+        assert_eq!(b.hri_font, 1);
+        assert_eq!(b.data, b"12");
+    }
+
+    #[test]
+    fn copias_gs_num() {
+        // GS # 3: el siguiente documento se imprime 3 veces
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0x1D, 0x23, 0x03]);
+        d.extend_from_slice(b"AB");
+        d.push(b'\n');
+        let doc = Parser::parse(&d);
+        assert_eq!(doc.copies, 3);
+        let texts = doc
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Text(t) => Some(t.runs.iter().map(|r| r.text.as_str()).collect::<String>()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["AB".to_string(); 3]);
+    }
+
+    #[test]
+    fn macro_definir_y_ejecutar() {
+        // GS : define una macro; GS ^ la ejecuta en el contexto actual
+        let mut d = Vec::new();
+        // Definir macro = [0x1D 0x40 "MACRO" 0x0A]  (pL pH m n + datos)
+        let content: Vec<u8> = [0x1D, 0x40].into_iter().chain(b"MACRO\n".iter().copied()).collect();
+        let len = (content.len() + 2) as u16; // m(1) + n(1) + contenido
+        d.extend_from_slice(&[0x1D, 0x3A]);
+        d.extend_from_slice(&len.to_le_bytes());
+        d.extend_from_slice(&[0x01, 0x00]);
+        d.extend_from_slice(&content);
+        // Ejecutar: GS ^ r t m
+        d.extend_from_slice(&[0x1D, 0x5E, 0x01, 0x00, 0x01]);
+        let doc = Parser::parse(&d);
+        assert_eq!(doc.memory.macro_bytes, Some(content));
+        let texts = doc
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Text(t) => Some(t.runs.iter().map(|r| r.text.as_str()).collect::<String>()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["MACRO".to_string()], "la macro debe imprimirse al ejecutarla");
+    }
+
+    #[test]
+    fn esc_8_y_esc_c5_panel() {
+        let d = vec![0x1B, b'8', 0x00];
+        let doc = Parser::parse(&d);
+        assert!(!doc.panel_enabled);
+        let d = vec![0x1B, b'c', 0x05, 0x00];
+        let doc = Parser::parse(&d);
+        assert!(!doc.panel_enabled);
+        let d = vec![0x1B, b'8', 0x01];
+        let doc = Parser::parse(&d);
+        assert!(doc.panel_enabled);
+    }
+
+    #[test]
+    fn esc_q_margen_derecho() {
+        // ESC l margen izq 10 + ESC Q margen der 100 -> área de 90 px
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0x1B, b'l', 10, 0]);
+        d.extend_from_slice(&[0x1B, b'Q', 100, 0]);
+        let doc = Parser::parse(&d);
+        let area = doc
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::SetPrintArea(a) => Some(a.clone()),
+                _ => None,
+            })
+            .expect("ESC Q debe fijar el área de impresión");
+        assert_eq!(area.left as i32, 10);
+        assert!((area.width - 90.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn gs_e_densidad_transmite_y_autotest() {
+        // fn=2 transmite densidad, fn=3 fija, fn=5 pide auto-test
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0x1D, 0x28, 0x45, 0x02, 0x00, 0x45, 0x02]);
+        d.extend_from_slice(&[0x1D, 0x28, 0x45, 0x03, 0x00, 0x45, 0x03, 0x2A]);
+        d.extend_from_slice(&[0x1D, 0x28, 0x45, 0x02, 0x00, 0x45, 0x02]);
+        d.extend_from_slice(&[0x1D, 0x28, 0x45, 0x02, 0x00, 0x45, 0x05]);
+        let doc = Parser::parse(&d);
+        assert_eq!(doc.memory.density, 42);
+        assert!(doc.auto_test);
+        // fn=2 transmitió la densidad inicial (0) y la nueva (42)
+        assert_eq!(doc.transmit, vec![vec![0], vec![42]]);
+    }
+
+    #[test]
+    fn buzzer_esc_c_fn06_cuenta_timbres() {
+        // ESC ( C pL pH 06 n m t
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0x1B, 0x28, 0x43, 0x04, 0x00, 0x06, 0x03, 0x01, 0x00]);
+        let doc = Parser::parse(&d);
+        assert_eq!(doc.buzz, 3);
+    }
+
+    #[test]
+    fn drawer_pulse_recogido() {
+        let d = vec![0x1B, b'p', 0x00, 0x32, 0x32]; // ESC p 0 n1=50 n2=50
+        let doc = Parser::parse(&d);
+        assert_eq!(doc.drawer_pulse_ms, Some(100), "n1=50 -> pulso de 100 ms");
+    }
+
+    #[test]
+    fn esc_u_registra_consulta_periferico() {
+        let d = vec![0x1B, b'u', 0x01];
+        let doc = Parser::parse(&d);
+        assert!(doc
+            .summary
+            .iter()
+            .any(|l| l.contains("ESC u") && l.contains("periférico")));
+    }
+
+    #[test]
+    fn dip_hri_abajo_por_defecto_y_corte_sin_cuchilla() {
+        // HRI abajo por defecto: los códigos de barras usan posición 2 sin GS H.
+        let d = vec![0x1D, b'k', 0x02, b'1', b'2', b'3', b'4', b'5', 0x00];
+        let doc = Parser::parse_with_dip(&d, &PrinterMemory::default(), crate::model::PrinterModel::EpsonTmT88V, 0, true, true);
+        let bc = doc
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Barcode(b) => Some(b),
+                _ => None,
+            })
+            .expect("debe emitirse un código de barras");
+        assert_eq!(bc.hri, 2, "con DIP HRI abajo, la posición por defecto es debajo");
+
+        // Sin cuchilla (auto_cut off): GS V no produce Item::Cut.
+        let d = vec![0x1D, b'V', 65];
+        let doc = Parser::parse_with_dip(&d, &PrinterMemory::default(), crate::model::PrinterModel::EpsonTmT88V, 0, true, false);
+        assert!(
+            !doc.items.iter().any(|it| matches!(it, Item::Cut { .. })),
+            "sin cuchilla no debe dibujarse la línea de corte"
+        );
+        assert!(doc.summary.iter().any(|l| l.contains("cuchilla automática")));
+
+        // Con cuchilla activa sí se corta.
+        let d = vec![0x1D, b'V', 65];
+        let doc = Parser::parse_with_dip(&d, &PrinterMemory::default(), crate::model::PrinterModel::EpsonTmT88V, 0, true, true);
+        assert!(doc.items.iter().any(|it| matches!(it, Item::Cut { .. })));
     }
 }

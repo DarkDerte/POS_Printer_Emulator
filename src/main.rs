@@ -3,12 +3,16 @@
 mod barcode;
 mod barcode2d;
 mod codepages;
+mod mdns;
+mod memory;
+mod model;
 mod nvstore;
 mod parser;
 mod printer;
 mod render;
 mod sample;
 mod server;
+mod sim;
 mod state;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -308,14 +312,172 @@ impl EmuApp {
                         }
                     }
                     ui.separator();
+                    ui.label("Modelo:");
+                    {
+                        let mut s = self.state.lock().unwrap();
+                        let mut m = s.model;
+                        egui::ComboBox::from_id_salt("model")
+                            .selected_text(m.label())
+                            .show_ui(ui, |ui| {
+                                for opt in model::PrinterModel::ALL {
+                                    ui.selectable_value(&mut m, opt, opt.label());
+                                }
+                            });
+                        if m != s.model {
+                            s.model = m;
+                            s.paper_width = m.default_width_px();
+                            self.paper_width = m.default_width_px();
+                            s.log(format!("Modelo seleccionado: {}", m.label()));
+                        }
+                    }
+                    ui.separator();
                     ui.label("Estado simulado:");
                     {
                         let mut s = self.state.lock().unwrap();
-                        ui.checkbox(&mut s.sim.paper_out, "Papel agotado");
-                        ui.checkbox(&mut s.sim.near_end, "Casi fin");
+                        if s.sim.is_paper_out() {
+                            ui.colored_label(Color32::RED, "SIN PAPEL");
+                        } else if s.sim.is_near_end() {
+                            ui.colored_label(Color32::YELLOW, "Papel casi fin");
+                        } else {
+                            ui.label(format!("Rollo: {:.1} m", s.sim.paper_mm / 1000.0));
+                        }
+                        if ui.button("Recargar rollo").clicked() {
+                            s.sim.reload();
+                        }
+                        if ui.checkbox(&mut s.power_on, "Encendida").on_hover_text("Sin alimentación no responde a la red").clicked()
+                            && !s.power_on
+                        {
+                            s.log("Impresora apagada".to_string());
+                        }
+                        ui.checkbox(&mut s.sim.sleeping, "Sleep/standby (offline)");
                         ui.checkbox(&mut s.sim.cover_open, "Tapa abierta");
                         ui.checkbox(&mut s.sim.error, "Error");
-                        ui.checkbox(&mut s.sim.drawer_open, "Cajón abierto");
+                        ui.checkbox(&mut s.sim.cutter_jam, "Cuchilla atascada");
+                        ui.checkbox(&mut s.sim.drawer_open, "Cajón 1 abierto");
+                        ui.checkbox(&mut s.sim.drawer2_open, "Cajón 2 abierto");
+                        ui.checkbox(&mut s.hex_dump, "Modo hex dump")
+                            .on_hover_text("Imprime los datos recibidos como hex/ASCII");
+                        ui.checkbox(&mut s.instant_print, "Impresión instantánea")
+                            .on_hover_text("Desactiva el retardo mecánico");
+                        if !s.instant_print {
+                            ui.add(
+                                egui::Slider::new(&mut s.print_speed_mm_s, 10..=300)
+                                    .text("velocidad (mm/s)"),
+                            );
+                        }
+                    }
+                    ui.separator();
+                    // LEDs del panel frontal (como una térmica real)
+                    {
+                        let s = self.state.lock().unwrap();
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                Color32::from_rgb(40, 200, 90),
+                                if s.power_on { "● Power" } else { "○ Power" },
+                            );
+                            ui.colored_label(
+                                Color32::RED,
+                                if s.sim.error || s.sim.cover_open || s.sim.cutter_jam {
+                                    "● Error"
+                                } else {
+                                    "○ Error"
+                                },
+                            );
+                            ui.colored_label(
+                                Color32::from_rgb(240, 200, 40),
+                                if s.sim.is_paper_out() || s.sim.is_near_end() {
+                                    "● Papel"
+                                } else {
+                                    "○ Papel"
+                                },
+                            );
+                            ui.colored_label(
+                                Color32::from_rgb(120, 170, 230),
+                                if s.sim.sleeping { "● Sleep" } else { "○ Sleep" },
+                            );
+                            if s.printing {
+                                ui.colored_label(Color32::from_rgb(60, 160, 200), "Imprimiendo…");
+                            }
+                            if s.paused {
+                                ui.colored_label(Color32::from_rgb(240, 160, 60), "PAUSA");
+                            }
+                        });
+                    }
+                    // Botones del panel: PAUSE y aviso si están deshabilitados
+                    {
+                        let mut s = self.state.lock().unwrap();
+                        ui.horizontal(|ui| {
+                            if ui.toggle_value(&mut s.paused, "PAUSA").changed() {
+                                let msg = if s.paused {
+                                    "Panel: PAUSA activada".to_string()
+                                } else {
+                                    "Panel: PAUSA liberada".to_string()
+                                };
+                                s.log(msg);
+                            }
+                            if !s.panel_enabled {
+                                ui.colored_label(Color32::YELLOW, "Panel deshabilitado (ESC 8)");
+                            }
+                        });
+                    }
+                    // DIP switches / memoria de fábrica
+                    {
+                        let mut s = self.state.lock().unwrap();
+                        let mut dip = s.dip;
+                        let mut changed = false;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("DIP:");
+                            egui::ComboBox::from_id_salt("dip_cp")
+                                .selected_text(format!("CP{}", dip.initial_codepage))
+                                .show_ui(ui, |ui| {
+                                    for (code, name) in [
+                                        (0u8, "437"),
+                                        (2, "850"),
+                                        (11, "866"),
+                                        (13, "858"),
+                                        (16, "1252"),
+                                        (18, "1250"),
+                                        (21, "874"),
+                                    ] {
+                                        changed |= ui
+                                            .selectable_value(&mut dip.initial_codepage, code, name)
+                                            .changed();
+                                    }
+                                });
+                            changed |= ui.checkbox(&mut dip.auto_cut, "Auto-corte").changed();
+                            changed |= ui.checkbox(&mut dip.hri_below, "HRI abajo").changed();
+                            changed |= ui.checkbox(&mut dip.buzzer_enabled, "Buzzer").changed();
+                            ui.label("Papel:");
+                            changed |= ui
+                                .radio_value(&mut dip.paper_width_mm, 58u16, "58mm")
+                                .changed();
+                            changed |= ui
+                                .radio_value(&mut dip.paper_width_mm, 80u16, "80mm")
+                                .changed();
+                            changed |= ui
+                                .radio_value(&mut dip.paper_width_mm, 112u16, "112mm")
+                                .changed();
+                        });
+                        if changed {
+                            s.dip = dip;
+                            s.paper_width = s.dip.paper_width_px();
+                            self.paper_width = s.paper_width;
+                            let msg = format!(
+                                "DIP: CP{}, corte {}, HRI {}, buzzer {}, {}mm",
+                                s.dip.initial_codepage,
+                                s.dip.auto_cut,
+                                s.dip.hri_below,
+                                s.dip.buzzer_enabled,
+                                s.dip.paper_width_mm
+                            );
+                            s.log(msg);
+                        }
+                        if ui.button("Restablecer fábrica").clicked() {
+                            s.factory_reset();
+                            self.paper_width = s.paper_width;
+                            self.tex = None;
+                            self.msg = Some("Fábrica restablecida".to_string());
+                        }
                     }
                     ui.separator();
                     if ui
@@ -332,11 +494,27 @@ impl EmuApp {
                     }
                     if running {
                         ui.separator();
-                        if ui.button("Feed").on_hover_text("Avance físico de papel (ESC J, ~12 mm)").clicked() {
+                        let panel = self.state.lock().unwrap().panel_enabled;
+                        if ui
+                            .add_enabled(panel, egui::Button::new("Feed"))
+                            .on_hover_text("Avance físico de papel (ESC J, ~12 mm)")
+                            .clicked()
+                        {
                             self.send_feed(100);
                         }
-                        if ui.button("Corte").on_hover_text("Corte de papel (GS V 66)").clicked() {
+                        if ui
+                            .add_enabled(panel, egui::Button::new("Corte"))
+                            .on_hover_text("Corte de papel (GS V 66)")
+                            .clicked()
+                        {
                             self.send_cut();
+                        }
+                        if ui
+                            .add_enabled(panel, egui::Button::new("Auto-test"))
+                            .on_hover_text("Imprime la página de diagnóstico")
+                            .clicked()
+                        {
+                            server::push_selftest(self.state.clone(), &self.fonts);
                         }
                     }
                     ui.separator();

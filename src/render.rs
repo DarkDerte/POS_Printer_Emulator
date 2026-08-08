@@ -64,6 +64,8 @@ pub struct Renderer<'a> {
     left_margin: f32,
     print_width: Option<f32>,
     logo: Option<LogoItem>,
+    main_cv: Option<Canvas>,
+    page_dir: u8,
 }
 
 struct Canvas {
@@ -169,6 +171,8 @@ pub fn render(items: &[Item], width: usize, fonts: &Fonts) -> RenderedPage {
         left_margin: 0.0,
         print_width: None,
         logo: None,
+        main_cv: None,
+        page_dir: 0,
     };
     r.cv.ensure(1024);
     for item in items {
@@ -176,11 +180,30 @@ pub fn render(items: &[Item], width: usize, fonts: &Fonts) -> RenderedPage {
     }
     let used = r.cv.used.max(r.cv.y as usize).max(1);
     r.cv.buf.truncate(used * width * 4);
+    // Aspecto de papel térmico: degradado cálido (crema) en vez de blanco puro.
+    for px in r.cv.buf.chunks_exact_mut(4) {
+        let v = px[0];
+        let [r, g, b] = thermal_rgb(v);
+        px[0] = r;
+        px[1] = g;
+        px[2] = b;
+        px[3] = 0xFF;
+    }
     RenderedPage {
         width,
         height: used,
         rgba: r.cv.buf,
     }
+}
+
+// Convierte un nivel de gris (0=negro, 255=blanco) al tono del papel térmico.
+fn thermal_rgb(v: u8) -> [u8; 3] {
+    let vf = v as f32 / 255.0;
+    [
+        (30.0 + vf * 225.0) as u8,
+        (26.0 + vf * 224.0) as u8,
+        (22.0 + vf * 218.0) as u8,
+    ]
 }
 
 impl<'a> Renderer<'a> {
@@ -236,6 +259,49 @@ impl<'a> Renderer<'a> {
                 self.print_width = Some(pa.width.max(0.0));
                 self.cv.clip_right = (pa.left + pa.width).max(0.0) as i32;
                 self.cv.x = self.left_margin;
+            }
+            Item::PageStart { width, height, dir } => {
+                let mut page = Canvas::new(width.max(1.0) as usize);
+                page.ensure(height.max(1.0) as usize + 16);
+                page.clip_right = width.max(1.0) as i32;
+                self.main_cv = Some(std::mem::replace(&mut self.cv, page));
+                self.page_dir = *dir & 0x03;
+                self.left_margin = 0.0;
+                self.print_width = Some(width.max(1.0));
+            }
+            Item::PageEnd { height } => {
+                if let Some(main) = self.main_cv.take() {
+                    let page = std::mem::replace(&mut self.cv, main);
+                    let w = page.w.max(1);
+                    let h = (height.max(0.0) as usize).min(page.used).max(1);
+                    let ox = self.cv.x as i32;
+                    let oy = self.cv.y as i32;
+                    for sy in 0..h {
+                        for sx in 0..w {
+                            let v = page.buf[(sy * w + sx) * 4];
+                            if v >= 250 {
+                                continue;
+                            }
+                            let (dx, dy) = match self.page_dir {
+                                1 => (sy as i32, w as i32 - 1 - sx as i32),
+                                2 => (w as i32 - 1 - sx as i32, h as i32 - 1 - sy as i32),
+                                3 => (h as i32 - 1 - sy as i32, sx as i32),
+                                _ => (sx as i32, sy as i32),
+                            };
+                            let cov = (255 - v) as f32 / 255.0;
+                            if cov > 0.0 {
+                                self.cv.set(ox + dx, oy + dy, cov);
+                            }
+                        }
+                    }
+                    let vh = if matches!(self.page_dir, 1 | 3) {
+                        w as f32
+                    } else {
+                        h as f32
+                    };
+                    self.cv.y = self.cv.y.max(oy as f32 + vh);
+                    self.cv.ensure(self.cv.y as usize + 64);
+                }
             }
             Item::StoreLogo(l) => {
                 self.logo = Some(l.clone());
@@ -354,7 +420,8 @@ impl<'a> Renderer<'a> {
             FontSel::A => 12.0,
             FontSel::B => 9.0,
         };
-        base * run.style.size_x.max(1) as f32
+        let cond = if run.style.condensed { 0.5 } else { 1.0 };
+        base * run.style.size_x.max(1) as f32 * cond
     }
 
     fn ascent_px(&self, h: f32) -> f32 {
@@ -579,9 +646,12 @@ impl<'a> Renderer<'a> {
             68 => crate::barcode::ean8_modules(&b.data),
             65 => crate::barcode::upca_as_ean13(&b.data)
                 .and_then(|d| crate::barcode::ean13_modules(&d)),
+            66 => crate::barcode::upce_modules(&b.data),
             73 => crate::barcode::code128_modules(&b.data),
             70 => crate::barcode::itf_modules(&b.data),
             69 => crate::barcode::code39_modules(&b.data),
+            71 => crate::barcode::codabar_modules(&b.data),
+            72 => crate::barcode::code93_modules(&b.data),
             _ => None,
         };
         let data_w = if let Some(m) = &modules {
@@ -592,6 +662,25 @@ impl<'a> Renderer<'a> {
         let ox = (self.cv.w as i32 - data_w).max(0) / 2;
         self.cv.ensure(self.cv.y as usize + bar_h as usize);
         let y0 = self.cv.y as i32;
+        // HRI por encima del código: se reserva una línea, se dibuja y se restaura
+        let hri_text: Option<String> = if b.hri != 0 {
+            Some(
+                b.data
+                    .iter()
+                    .map(|&c| if (0x20..=0x7E).contains(&c) { c as char } else { '?' })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        if let Some(t) = &hri_text {
+            if matches!(b.hri, 1 | 3) {
+                let th: f32 = if b.hri_font == 1 { 17.0 } else { 24.0 };
+                self.cv.y = (self.cv.y - th).max(0.0);
+                self.draw_hri(t, b.hri_font == 1);
+                self.cv.y = y0 as f32;
+            }
+        }
         match modules {
             Some(m) => {
                 for (i, bar) in m.iter().enumerate() {
@@ -615,14 +704,27 @@ impl<'a> Renderer<'a> {
         self.cv.y += bar_h as f32;
         self.cv.x = self.left_margin;
         self.cv.used = self.cv.used.max(self.cv.y as usize);
-        if b.hri != 0 {
-            let text: String = b
-                .data
-                .iter()
-                .map(|&c| if (0x20..=0x7E).contains(&c) { c as char } else { '?' })
-                .collect();
-            self.draw_text_plain(&text, true);
+        if let Some(t) = &hri_text {
+            if matches!(b.hri, 2 | 3) {
+                self.draw_hri(t, b.hri_font == 1);
+            }
         }
+    }
+
+    fn draw_hri(&mut self, text: &str, font_b: bool) {
+        use crate::parser::FontSel;
+        let run = crate::parser::TextRun {
+            text: text.to_string(),
+            style: crate::parser::Style {
+                font: if font_b { FontSel::B } else { FontSel::A },
+                ..crate::parser::Style::default()
+            },
+        };
+        let item = crate::parser::TextItem {
+            runs: vec![run],
+            align: crate::parser::Alignment::Center,
+        };
+        self.render_text(&item);
     }
 
     fn render_2d(&mut self, b: &Barcode2DItem) {

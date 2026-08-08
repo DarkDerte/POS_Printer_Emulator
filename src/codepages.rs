@@ -5,6 +5,15 @@ pub enum Codepage {
     Cp858,
     Cp866,
     Cp1252,
+    Cp1250,
+    Cp1251,
+    Cp1253,
+    Cp1256,
+    Cp874,
+    Cp932, // Shift-JIS
+    Cp936, // GBK
+    Cp949, // EUC-KR (windows-949)
+    Cp950, // Big5
 }
 
 static CP437_HIGH: [char; 128] = [
@@ -85,13 +94,89 @@ static CP1252_HIGH: [char; 128] = [
 
 pub fn table(n: u8) -> Codepage {
     match n {
-        0 | 1 | 3 | 4 | 5 | 10 | 255 => Codepage::Cp437,
         2 => Codepage::Cp850,
+        11 => Codepage::Cp866,
+        13 | 255 => Codepage::Cp858,
+        14 | 21 => Codepage::Cp874,
         16 => Codepage::Cp1252,
-        17 => Codepage::Cp866,
-        19 => Codepage::Cp858,
+        18 | 22 => Codepage::Cp1250,
+        19 | 23 => Codepage::Cp1251,
+        20 | 24 | 25 | 26 | 27 | 28 | 29 => Codepage::Cp437,
+        80 => Codepage::Cp874,
+        81 => Codepage::Cp932,
+        82 => Codepage::Cp936,
+        83 => Codepage::Cp949,
+        84 => Codepage::Cp950,
+        85 => Codepage::Cp1251,
+        86 => Codepage::Cp1250,
+        87 => Codepage::Cp1253,
+        88 => Codepage::Cp1256,
         _ => Codepage::Cp437,
     }
+}
+
+// Los codepages multibyte (JIS/GBK/EUC-KR/Big5) se decodifican por pares.
+pub fn is_double_byte(cp: Codepage) -> bool {
+    matches!(cp, Codepage::Cp932 | Codepage::Cp936 | Codepage::Cp949 | Codepage::Cp950)
+}
+
+pub fn is_lead(cp: Codepage, b: u8) -> bool {
+    match cp {
+        Codepage::Cp932 => (0x81..=0x9F).contains(&b) || (0xE0..=0xEF).contains(&b),
+        Codepage::Cp936 => (0x81..=0xFE).contains(&b),
+        Codepage::Cp949 => (0x81..=0xFE).contains(&b),
+        Codepage::Cp950 => (0x81..=0xFE).contains(&b),
+        _ => false,
+    }
+}
+
+pub fn is_trail(cp: Codepage, b: u8) -> bool {
+    match cp {
+        Codepage::Cp932 => (0x40..=0x7E).contains(&b) || (0x80..=0xFC).contains(&b),
+        Codepage::Cp936 => (0x40..=0xFE).contains(&b) && b != 0x7F,
+        Codepage::Cp949 => (0x41..=0xFE).contains(&b),
+        Codepage::Cp950 => (0x40..=0x7E).contains(&b) || (0xA1..=0xFE).contains(&b),
+        _ => false,
+    }
+}
+
+fn decode_rs(enc: &'static encoding_rs::Encoding, b: u8) -> char {
+    let buf = [b];
+    let (s, _, _) = enc.decode(&buf);
+    s.chars().next().unwrap_or('\u{FFFD}')
+}
+
+fn decode_pair_rs(enc: &'static encoding_rs::Encoding, lead: u8, trail: u8) -> Option<String> {
+    let buf = [lead, trail];
+    let (s, _, had) = enc.decode(&buf);
+    if had || s.contains('\u{FFFD}') {
+        return None;
+    }
+    Some(s.into_owned())
+}
+
+// Decodifica un par en el codepage multibyte activo.
+pub fn decode_pair(cp: Codepage, lead: u8, trail: u8) -> Option<String> {
+    match cp {
+        Codepage::Cp932 => decode_pair_rs(encoding_rs::SHIFT_JIS, lead, trail),
+        Codepage::Cp936 => decode_pair_rs(encoding_rs::GBK, lead, trail),
+        Codepage::Cp949 => decode_pair_rs(encoding_rs::EUC_KR, lead, trail),
+        Codepage::Cp950 => decode_pair_rs(encoding_rs::BIG5, lead, trail),
+        _ => None,
+    }
+}
+
+// Modo kanji (FS & / FS 2): los pares se interpretan como Shift-JIS.
+pub fn kanji_lead(b: u8) -> bool {
+    (0x81..=0x9F).contains(&b) || (0xE0..=0xEF).contains(&b)
+}
+
+pub fn kanji_trail(b: u8) -> bool {
+    (0x40..=0x7E).contains(&b) || (0x80..=0xFC).contains(&b)
+}
+
+pub fn decode_kanji_pair(lead: u8, trail: u8) -> Option<String> {
+    decode_pair_rs(encoding_rs::SHIFT_JIS, lead, trail)
 }
 
 pub fn decode(cp: Codepage, b: u8) -> char {
@@ -110,6 +195,15 @@ pub fn decode(cp: Codepage, b: u8) -> char {
             } else {
                 CP437_HIGH[idx]
             }
+        }
+        Codepage::Cp1250 => decode_rs(encoding_rs::WINDOWS_1250, b),
+        Codepage::Cp1251 => decode_rs(encoding_rs::WINDOWS_1251, b),
+        Codepage::Cp1253 => decode_rs(encoding_rs::WINDOWS_1253, b),
+        Codepage::Cp1256 => decode_rs(encoding_rs::WINDOWS_1256, b),
+        Codepage::Cp874 => decode_rs(encoding_rs::WINDOWS_874, b),
+        Codepage::Cp932 | Codepage::Cp936 | Codepage::Cp949 | Codepage::Cp950 => {
+            // byte suelto en contexto multibyte: carácter de reemplazo
+            '\u{FFFD}'
         }
     }
 }

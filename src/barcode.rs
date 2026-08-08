@@ -126,12 +126,171 @@ pub fn upca_as_ean13(digits: &[u8]) -> Option<Vec<u8>> {
     Some(ean)
 }
 
+// UPC-E: recibe 8 dígitos (D1..D8, con dígito de control) y produce 51 módulos.
+// D1 (sistema de numeración) determina la paridad: 0 -> códigos L, 1 -> códigos G.
+pub fn upce_modules(digits: &[u8]) -> Option<Vec<bool>> {
+    let d = digits_from(digits)?;
+    if d.len() != 8 || d[0] > 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(51);
+    out.extend_from_slice(&[true, false, true]);
+    for &dig in &d[1..7] {
+        if d[0] == 0 {
+            out.extend_from_slice(l_code(dig as usize));
+        } else {
+            out.extend_from_slice(&g_code(dig as usize));
+        }
+    }
+    out.extend_from_slice(&[false, true, false, true, false, true]);
+    Some(out)
+}
+
+// Expande los 7 dígitos de UPC-E (D1..D7) a los 11 primeros de UPC-A (ASCII).
+pub fn upce_expand(digits: &[u8]) -> Option<Vec<u8>> {
+    let d = digits_from(digits)?;
+    if d.len() != 7 || d[0] > 1 {
+        return None;
+    }
+    let (d2, d3, d4, d5, d6, d7) = (d[1], d[2], d[3], d[4], d[5], d[6]);
+    let mut upca = vec![d[0]];
+    match d6 {
+        0..=2 => upca.extend_from_slice(&[d2, d3, d4, d5, d6, 0, 0, 0, 0, d7]),
+        3 => upca.extend_from_slice(&[d2, d3, d4, d5, 0, 0, 0, 0, 0, d7]),
+        4 => upca.extend_from_slice(&[d2, d3, d4, 0, 0, 0, 0, 0, d5, d7]),
+        _ => upca.extend_from_slice(&[d2, d3, d4, d5, d7, 0, 0, 0, 0, 0]),
+    }
+    Some(upca.iter().map(|&n| b'0' + n).collect())
+}
+
+// Tabla de patrones Codabar: 1 = ancho, 0 = estrecho; 7 elementos por símbolo.
+const CODABAR: [&str; 20] = [
+    "0000011", "0000110", "0001100", "0011000", "0110000", "1000011", "1100000", "0001001",
+    "0010001", "0100001", "0001010", "0010100", "1010000", "0101000", "1000100", "1000101",
+    "0011010", "0100011", "1000110", "1101000",
+];
+
+fn codabar_index(c: u8) -> Option<usize> {
+    match c {
+        b'0'..=b'9' => Some((c - b'0') as usize),
+        b'-' => Some(10),
+        b'$' => Some(11),
+        b':' => Some(12),
+        b'/' => Some(13),
+        b'.' => Some(14),
+        b'+' => Some(15),
+        b'A' | b'a' => Some(16),
+        b'B' | b'b' => Some(17),
+        b'C' | b'c' => Some(18),
+        b'D' | b'd' => Some(19),
+        _ => None,
+    }
+}
+
+// Codabar: añade A/B de inicio/parada si faltan y dibuja los elementos
+// (barra/espacio alternos, ancho = 3 módulos si es 1).
+pub fn codabar_modules(data: &[u8]) -> Option<Vec<bool>> {
+    let mut chars: Vec<u8> = data.iter().map(|&c| c.to_ascii_uppercase()).collect();
+    if chars.is_empty() {
+        return None;
+    }
+    if !chars[0].is_ascii_uppercase() || !(b'A'..=b'D').contains(&chars[0]) {
+        chars.insert(0, b'A');
+    }
+    let last = *chars.last().unwrap();
+    if !(b'A'..=b'D').contains(&last) {
+        chars.push(b'B');
+    }
+    let mut out = Vec::new();
+    for (ci, &c) in chars.iter().enumerate() {
+        let pat = CODABAR[codabar_index(c)?];
+        for (i, ch) in pat.bytes().enumerate() {
+            let wide = ch == b'1';
+            let w = if wide { 3 } else { 1 };
+            let is_bar = i % 2 == 0;
+            for _ in 0..w {
+                out.push(is_bar);
+            }
+        }
+        if ci + 1 < chars.len() {
+            out.push(false); // separación inter-carácter estrecha
+        }
+    }
+    Some(out)
+}
+
+// Tabla de patrones Code 93 (valores 0..=47, 9 módulos; el 47 es * inicio/parada).
+const CODE93: [&str; 48] = [
+    "100010100", "101001000", "101000100", "101000010", "100101000", "100100100",
+    "100100010", "101010000", "100010010", "100001010", "110101000", "110100100",
+    "110100010", "110010100", "110010010", "110001010", "101101000", "101100100",
+    "101100010", "100110100", "100011010", "101011000", "101001100", "101000110",
+    "100101100", "100010110", "110110100", "110110010", "110101100", "110100110",
+    "110010110", "110011010", "101101100", "101100110", "100110110", "100111010",
+    "100101110", "111010100", "111010010", "111001010", "101101110", "101110110",
+    "110101110", "100100110", "111011010", "111010110", "100110010", "101011110",
+];
+
+fn code93_value(c: u8) -> Option<usize> {
+    match c {
+        b'0'..=b'9' => Some((c - b'0') as usize),
+        b'A'..=b'Z' => Some((c - b'A') as usize + 10),
+        b'-' => Some(36),
+        b'.' => Some(37),
+        b' ' => Some(38),
+        b'$' => Some(39),
+        b'/' => Some(40),
+        b'+' => Some(41),
+        b'%' => Some(42),
+        _ => None,
+    }
+}
+
+fn code93_modules_from_values(values: &[usize]) -> Vec<bool> {
+    let mut out = Vec::new();
+    for &v in values {
+        let pat = CODE93[v];
+        for (i, ch) in pat.bytes().enumerate() {
+            let n = (ch - b'0') as usize;
+            for _ in 0..n {
+                out.push(i % 2 == 0); // índice par = barra
+            }
+        }
+    }
+    out
+}
+
+// Code 93: valores + caracteres de control C y K, con inicio/parada *.
+pub fn code93_modules(data: &[u8]) -> Option<Vec<bool>> {
+    if data.is_empty() {
+        return None;
+    }
+    let mut values: Vec<usize> = data.iter().map(|&c| code93_value(c)).collect::<Option<_>>()?;
+    let mut c = 0usize;
+    for (i, &v) in values.iter().rev().enumerate() {
+        c = (c + v * ((i % 20) + 1)) % 47;
+    }
+    let mut k = 0usize;
+    for (i, &v) in values.iter().rev().chain(std::iter::once(&c)).enumerate() {
+        k = (k + v * ((i % 20) + 1)) % 47;
+    }
+    values.push(c);
+    values.push(k);
+    let mut out = Vec::new();
+    out.extend_from_slice(&code93_modules_from_values(&[47]));
+    out.extend_from_slice(&code93_modules_from_values(&values));
+    out.extend_from_slice(&code93_modules_from_values(&[47]));
+    out.push(true); // barra de terminación
+    Some(out)
+}
+
 // Normaliza y valida datos de GS k; devuelve (datos, aviso opcional).
 pub fn validate(m: u8, data: &[u8]) -> (Vec<u8>, Option<String>) {
     // Los códigos 1D admiten dos familias de m: 0..=6 (longitud explícita) y
     // 65..=73 (terminado en NUL). Se unifican para validar igual.
     let norm_m = match m {
         0 | 65 => 65, // UPC-A
+        1 | 66 => 66, // UPC-E
         2 | 67 => 67, // EAN-13
         3 | 68 => 68, // EAN-8
         4 | 69 => 69, // Code 39
@@ -163,6 +322,40 @@ pub fn validate(m: u8, data: &[u8]) -> (Vec<u8>, Option<String>) {
                 }
             } else {
                 (data.to_vec(), Some("UPC-A: se requieren 11/12 dígitos".to_string()))
+            }
+        }
+        66 => {
+            // UPC-E: 7 u 8 dígitos (se añade el dígito de control si falta)
+            if digits(data) && (data.len() == 7 || data.len() == 8) {
+                let mut d = data.to_vec();
+                if d.len() == 7 {
+                    let cd = upce_expand(&d).map(|u| check_digit(&u));
+                    match cd {
+                        Some(cd) => {
+                            d.push(b'0' + cd);
+                            (d, Some("UPC-E: dígito de control calculado".to_string()))
+                        }
+                        None => (d, Some("UPC-E: sistema de numeración inválido".to_string())),
+                    }
+                } else {
+                    let cd = upce_expand(&d[..7]).map(|u| check_digit(&u));
+                    match cd {
+                        Some(cd) => {
+                            let msg = if d[7] == b'0' + cd {
+                                None
+                            } else {
+                                Some(format!(
+                                    "UPC-E: dígito de control inválido (era {}, debería ser {cd})",
+                                    d[7] as char
+                                ))
+                            };
+                            (d, msg)
+                        }
+                        None => (d, Some("UPC-E: sistema de numeración inválido".to_string())),
+                    }
+                }
+            } else {
+                (data.to_vec(), Some("UPC-E: se requieren 7/8 dígitos".to_string()))
             }
         }
         67 => {
@@ -475,5 +668,43 @@ mod tests {
         assert!(!m.is_empty());
         assert_eq!(code39_modules(b"a"), None);
         assert_eq!(code39_index(b'Z'), Some(35));
+    }
+
+    #[test]
+    fn upce_modulos_y_control() {
+        // 0123456 -> UPC-E válido (expansión 01234560000 -> control 2)
+        let m = upce_modules(b"01234562").unwrap();
+        assert_eq!(m.len(), 51);
+        assert_eq!(upce_modules(b"22345670"), None); // sistema 2 no válido
+        let exp = upce_expand(b"0123456").unwrap();
+        assert_eq!(check_digit(&exp), 2);
+    }
+
+    #[test]
+    fn codabar_modulos() {
+        let m = codabar_modules(b"1234").unwrap();
+        assert!(!m.is_empty());
+        // añade A...B automáticamente
+        assert_eq!(codabar_modules(b"A1234B").unwrap().len(), m.len());
+        assert_eq!(codabar_modules(b"x1"), None);
+    }
+
+    #[test]
+    fn code93_modulos_y_checksum() {
+        let m = code93_modules(b"ABC123").unwrap();
+        assert!(!m.is_empty());
+        assert_eq!(code93_modules(b"a"), None);
+        assert_eq!(code93_modules(b""), None);
+        // determinismo
+        assert_eq!(code93_modules(b"TEST").unwrap(), code93_modules(b"TEST").unwrap());
+    }
+
+    #[test]
+    fn upce_validate_control() {
+        let (d, warn) = validate(66, b"0123456");
+        assert_eq!(d.len(), 8);
+        assert!(warn.is_some());
+        let (d2, _) = validate(1, b"0123456");
+        assert_eq!(d2.len(), 8);
     }
 }

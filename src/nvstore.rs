@@ -5,7 +5,9 @@
 //   "POSNV1" (6)
 //   logo:    1 byte presente, u32le width, u32le height, u32le len, bytes
 //   fonts:   u32le count, por fuente: 1 byte carácter, u32le len, bytes
+//   kanji:   u32le count, por kanji: u16le code, u32le len, bytes
 //   density: 1 byte
+//   macro:   1 byte presente, u32le len, bytes  (opcional: si no está, None)
 use std::io;
 use std::path::PathBuf;
 
@@ -42,13 +44,34 @@ pub fn save_at(memory: &PrinterMemory, path: &PathBuf) -> io::Result<()> {
         }
         None => out.push(0),
     }
+    out.extend_from_slice(&(memory.logos.len() as u32).to_le_bytes());
+    for l in &memory.logos {
+        out.extend_from_slice(&(l.width as u32).to_le_bytes());
+        out.extend_from_slice(&(l.height as u32).to_le_bytes());
+        out.extend_from_slice(&(l.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&l.data);
+    }
     out.extend_from_slice(&(memory.user_font.len() as u32).to_le_bytes());
     for (ch, bytes) in &memory.user_font {
         out.push(*ch);
         out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(bytes);
     }
+    out.extend_from_slice(&(memory.user_kanji.len() as u32).to_le_bytes());
+    for (code, bytes) in &memory.user_kanji {
+        out.extend_from_slice(&code.to_le_bytes());
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
     out.push(memory.density);
+    match &memory.macro_bytes {
+        Some(bytes) => {
+            out.push(1);
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        None => out.push(0),
+    }
 
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -88,6 +111,18 @@ pub fn load_at(path: &PathBuf) -> Option<PrinterMemory> {
             Some(LogoItem { data, width, height })
         }
     };
+    let nl = u32_le(&mut it)? as usize;
+    let mut logos = Vec::with_capacity(nl);
+    for _ in 0..nl {
+        let width = u32_le(&mut it)? as usize;
+        let height = u32_le(&mut it)? as usize;
+        let len = u32_le(&mut it)? as usize;
+        let mut data = vec![0u8; len];
+        for b in &mut data {
+            *b = it.next()?;
+        }
+        logos.push(LogoItem { data, width, height });
+    }
     let nf = u32_le(&mut it)? as usize;
     let mut user_font = Vec::with_capacity(nf);
     for _ in 0..nf {
@@ -99,11 +134,41 @@ pub fn load_at(path: &PathBuf) -> Option<PrinterMemory> {
         }
         user_font.push((ch, data));
     }
+    let nk = u32_le(&mut it)? as usize;
+    let mut user_kanji = Vec::with_capacity(nk);
+    for _ in 0..nk {
+        let mut c = [0u8; 2];
+        for slot in &mut c {
+            *slot = it.next()?;
+        }
+        let code = u16::from_le_bytes(c);
+        let len = u32_le(&mut it)? as usize;
+        let mut data = vec![0u8; len];
+        for b in &mut data {
+            *b = it.next()?;
+        }
+        user_kanji.push((code, data));
+    }
     let density = it.next()?;
+    // La macro es opcional (ficheros de versiones anteriores no la incluyen).
+    let macro_bytes = match it.next() {
+        Some(1) => {
+            let len = u32_le(&mut it)? as usize;
+            let mut data = vec![0u8; len];
+            for b in &mut data {
+                *b = it.next()?;
+            }
+            Some(data)
+        }
+        Some(_) | None => None,
+    };
     Some(PrinterMemory {
         logo,
+        logos,
         user_font,
+        user_kanji,
         density,
+        macro_bytes,
     })
 }
 
@@ -122,14 +187,45 @@ mod tests {
                 width: 16,
                 height: 8,
             }),
+            logos: vec![
+                LogoItem {
+                    data: vec![1, 2, 3],
+                    width: 8,
+                    height: 2,
+                },
+                LogoItem {
+                    data: vec![4, 5, 6, 7],
+                    width: 8,
+                    height: 3,
+                },
+            ],
             user_font: vec![(b'A', vec![1, 2, 3, 4, 5, 6, 7, 8])],
+            user_kanji: vec![(0x889F, vec![9; 32])],
             density: 42,
+            macro_bytes: Some(vec![0x1B, b'@', b'H', b'i']),
         };
         assert!(save_at(&mem, &path).is_ok());
         let loaded = load_at(&path).unwrap();
         assert_eq!(loaded.logo.unwrap().data, vec![0xAA, 0x55, 0xFF]);
+        assert_eq!(
+            loaded.logos,
+            vec![
+                LogoItem {
+                    data: vec![1, 2, 3],
+                    width: 8,
+                    height: 2,
+                },
+                LogoItem {
+                    data: vec![4, 5, 6, 7],
+                    width: 8,
+                    height: 3,
+                },
+            ]
+        );
         assert_eq!(loaded.user_font, vec![(b'A', vec![1, 2, 3, 4, 5, 6, 7, 8])]);
+        assert_eq!(loaded.user_kanji, vec![(0x889F, vec![9; 32])]);
         assert_eq!(loaded.density, 42);
+        assert_eq!(loaded.macro_bytes, Some(vec![0x1B, b'@', b'H', b'i']));
         let _ = std::fs::remove_file(&path);
     }
 
